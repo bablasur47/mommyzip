@@ -51,52 +51,54 @@ export function Users() {
             </div>
           ) : (
             <StaggerContainer className="space-y-2">
-            {filtered.map((user) => (<StaggerItem key={user.userId}>
-              <Link key={user.userId} href={`/users/${user.userId}`}>
-                <Card
-                  className="bg-card/40 border-border/60 hover:border-primary/40 kawaii-card cursor-pointer"
-                  data-testid={`card-user-${user.userId}`}
-                >
-                  <CardContent className="p-4 flex items-center gap-4">
-                    {user.avatarUrl ? (
-                      <img
-                        src={user.avatarUrl}
-                        alt={user.username}
-                        className="w-10 h-10 rounded-xl ring-1 ring-border/60"
-                      />
-                    ) : (
-                      <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary/20 to-purple-500/20 border border-primary/20 flex items-center justify-center text-primary font-semibold text-sm">
-                        {user.username.charAt(0).toUpperCase()}
+            {filtered.map((user) => (
+              <StaggerItem key={user.userId}>
+                <Link key={user.userId} href={`/users/${user.userId}`}>
+                  <Card
+                    className="bg-card/40 border-border/60 hover:border-primary/40 kawaii-card cursor-pointer"
+                    data-testid={`card-user-${user.userId}`}
+                  >
+                    <CardContent className="p-4 flex items-center gap-4">
+                      {user.avatarUrl ? (
+                        <img
+                          src={user.avatarUrl}
+                          alt={user.username}
+                          className="w-10 h-10 rounded-xl ring-1 ring-border/60"
+                        />
+                      ) : (
+                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary/20 to-purple-500/20 border border-primary/20 flex items-center justify-center text-primary font-semibold text-sm">
+                          {user.username.charAt(0).toUpperCase()}
+                        </div>
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-foreground truncate">{user.username}</span>
+                          {user.discriminator && user.discriminator !== "0" && (
+                            <span className="text-muted-foreground text-xs">#{user.discriminator}</span>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground font-mono">{user.userId}</p>
                       </div>
-                    )}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium text-foreground truncate">{user.username}</span>
-                        {user.discriminator && user.discriminator !== "0" && (
-                          <span className="text-muted-foreground text-xs">#{user.discriminator}</span>
-                        )}
+                      <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                        <span className="flex items-center gap-1">
+                          <MessageSquare className="w-3.5 h-3.5 text-primary/60" />
+                          {user.messageCount.toLocaleString()}
+                        </span>
+                        <span className="flex items-center gap-1 hidden sm:flex">
+                          <Clock className="w-3.5 h-3.5 text-primary/60" />
+                          {new Date(user.lastSeen).toLocaleDateString()}
+                        </span>
+                        <Badge variant="outline" className="text-xs border-border/60 hidden md:flex rounded-lg">
+                          {(user.servers ?? []).length} server{(user.servers ?? []).length !== 1 ? "s" : ""}
+                        </Badge>
                       </div>
-                      <p className="text-xs text-muted-foreground font-mono">{user.userId}</p>
-                    </div>
-                    <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                      <span className="flex items-center gap-1">
-                        <MessageSquare className="w-3.5 h-3.5 text-primary/60" />
-                        {user.messageCount.toLocaleString()}
-                      </span>
-                      <span className="flex items-center gap-1 hidden sm:flex">
-                        <Clock className="w-3.5 h-3.5 text-primary/60" />
-                        {new Date(user.lastSeen).toLocaleDateString()}
-                      </span>
-                      <Badge variant="outline" className="text-xs border-border/60 hidden md:flex rounded-lg">
-                        {(user.servers ?? []).length} server{(user.servers ?? []).length !== 1 ? "s" : ""}
-                      </Badge>
-                    </div>
-                    <ChevronRight className="w-4 h-4 text-muted-foreground ml-2" />
-                  </CardContent>
-                </Card>
-              </Link></StaggerItem>
-            ))
-          </StaggerContainer>
+                      <ChevronRight className="w-4 h-4 text-muted-foreground ml-2" />
+                    </CardContent>
+                  </Card>
+                </Link>
+              </StaggerItem>
+            ))}
+            </StaggerContainer>
           )}
         </div>
       )}
