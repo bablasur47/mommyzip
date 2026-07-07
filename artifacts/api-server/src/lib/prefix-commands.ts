@@ -530,7 +530,12 @@ async function handleFamily(message: Message, client: Client, args: string[]) {
     async function fetchChildNode(childId: string, depth: number): Promise<FamilyChildNode | null> {
       if (depth > MAX_DEPTH) return null;
       const cr = await UserRelationship.findOne({ userId: childId, guildId: GLOBAL_FAMILY });
-      if (!cr) return null;
+
+      // No relationship record — show as leaf node (no spouse, no children of their own)
+      if (!cr) {
+        const childUser = await resolveCardUser(childId, client, guildId);
+        return { user: childUser, spouse: null, children: [] };
+      }
 
       const csr = cr.marriedTo
         ? await UserRelationship.findOne({ userId: cr.marriedTo, guildId: GLOBAL_FAMILY })
