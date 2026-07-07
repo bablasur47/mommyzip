@@ -1,0 +1,2127 @@
+import { createCanvas, loadImage, GlobalFonts, type SKRSContext2D } from "@napi-rs/canvas";
+
+GlobalFonts.registerFromPath("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVu");
+GlobalFonts.registerFromPath("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVu");
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// Discord CDN only accepts specific power-of-2 sizes; snap to the nearest valid one
+function snapDiscordSize(size: number): number {
+  const valid = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+  return valid.reduce((prev, curr) =>
+    Math.abs(curr - size) < Math.abs(prev - size) ? curr : prev
+  );
+}
+
+async function fetchAvatar(url: string | null | undefined, size = 256): Promise<Buffer | null> {
+  if (!url) return null;
+  try {
+    // Strip existing query params, force PNG (napi-rs/canvas handles PNG/JPEG best)
+    let base = url.split("?")[0];
+    if (/\.(webp|gif)$/i.test(base)) base = base.replace(/\.(webp|gif)$/i, ".png");
+    const cdnSize = snapDiscordSize(size);
+    const res = await fetch(`${base}?size=${cdnSize}`);
+    if (!res.ok) return null;
+    return Buffer.from(await res.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+function drawStar(ctx: SKRSContext2D, cx: number, cy: number, spikes: number, outerR: number, innerR: number) {
+  let rot = (Math.PI / 2) * 3;
+  const step = Math.PI / spikes;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - outerR);
+  for (let i = 0; i < spikes; i++) {
+    ctx.lineTo(cx + Math.cos(rot) * outerR, cy + Math.sin(rot) * outerR);
+    rot += step;
+    ctx.lineTo(cx + Math.cos(rot) * innerR, cy + Math.sin(rot) * innerR);
+    rot += step;
+  }
+  ctx.lineTo(cx, cy - outerR);
+  ctx.closePath();
+}
+
+function roundedRect(ctx: SKRSContext2D, x: number, y: number, w: number, h: number, r: number) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+function truncate(str: string, max: number): string {
+  return str.length > max ? str.slice(0, max - 1) + "…" : str;
+}
+
+// cx/cy = center of avatar circle
+async function drawAvatar(
+  ctx: SKRSContext2D,
+  url: string | null | undefined,
+  cx: number,
+  cy: number,
+  r: number,
+  glowColor: string,
+  ringColor: string,
+  fallbackLetter = "?"
+) {
+  // Soft outer glow
+  ctx.save();
+  const glowGrad = ctx.createRadialGradient(cx, cy, r * 0.7, cx, cy, r + 18);
+  glowGrad.addColorStop(0, glowColor + "55");
+  glowGrad.addColorStop(1, "transparent");
+  ctx.fillStyle = glowGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 18, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Gradient ring
+  const ringGrad = ctx.createLinearGradient(cx - r - 6, cy - r - 6, cx + r + 6, cy + r + 6);
+  ringGrad.addColorStop(0, ringColor);
+  ringGrad.addColorStop(0.5, "#ffffff99");
+  ringGrad.addColorStop(1, ringColor);
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 5, 0, Math.PI * 2);
+  ctx.fillStyle = ringGrad;
+  ctx.shadowBlur = 14;
+  ctx.shadowColor = ringColor;
+  ctx.fill();
+  ctx.restore();
+
+  // Dark inner ring gap
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 1, 0, Math.PI * 2);
+  ctx.fillStyle = "#08080f";
+  ctx.fill();
+  ctx.restore();
+
+  // Avatar image clipped to circle
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+
+  let drawn = false;
+  if (url) {
+    const buf = await fetchAvatar(url, r * 4);
+    if (buf) {
+      try {
+        const img = await loadImage(buf);
+        ctx.drawImage(img, cx - r, cy - r, r * 2, r * 2);
+        drawn = true;
+      } catch { /* fallback */ }
+    }
+  }
+
+  if (!drawn) {
+    const fbGrad = ctx.createRadialGradient(cx, cy - r * 0.2, 0, cx, cy, r);
+    fbGrad.addColorStop(0, ringColor + "99");
+    fbGrad.addColorStop(1, "#111122");
+    ctx.fillStyle = fbGrad;
+    ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+  }
+  ctx.restore();
+
+  // Fallback letter
+  if (!drawn) {
+    ctx.save();
+    ctx.font = `bold ${Math.round(r * 0.75)}px "DejaVu"`;
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = ringColor;
+    ctx.fillText((fallbackLetter[0] ?? "?").toUpperCase(), cx, cy);
+    ctx.restore();
+  }
+}
+
+// ─── Love percentage ──────────────────────────────────────────────────────────
+
+export function calculateLovePercentage(id1: string, id2: string): number {
+  const combined = [id1, id2].sort().join("");
+  let h = 5381;
+  for (let i = 0; i < combined.length; i++) {
+    h = ((h << 5) + h) ^ combined.charCodeAt(i);
+    h = h >>> 0;
+  }
+  return h % 101;
+}
+
+export type CardUser = { id: string; username: string; avatarUrl?: string | null };
+
+// ─── Profile card ─────────────────────────────────────────────────────────────
+
+export type ProfileData = {
+  user: CardUser;
+  messageCount: number;
+  spouseName?: string | null;
+  parentsCount: number;
+  childrenCount: number;
+};
+
+export async function generateProfileCard(data: ProfileData): Promise<Buffer> {
+  const W = 820, H = 340;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  const { user, messageCount, spouseName, parentsCount, childrenCount } = data;
+
+  // ── Background ───────────────────────────────────────────────────────────────
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#0e0520");
+  bg.addColorStop(0.45, "#1a0730");
+  bg.addColorStop(1, "#0b051a");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Left-side accent wash
+  const lw = ctx.createRadialGradient(140, H / 2, 10, 140, H / 2, 260);
+  lw.addColorStop(0, "rgba(155,80,210,0.20)");
+  lw.addColorStop(1, "transparent");
+  ctx.fillStyle = lw;
+  ctx.fillRect(0, 0, W, H);
+
+  // Right-side pink wash
+  const rw = ctx.createRadialGradient(W - 60, H / 2, 10, W - 60, H / 2, 280);
+  rw.addColorStop(0, "rgba(233,30,99,0.10)");
+  rw.addColorStop(1, "transparent");
+  ctx.fillStyle = rw;
+  ctx.fillRect(0, 0, W, H);
+
+  // Tiny star field
+  for (let i = 0; i < 100; i++) {
+    const sx = (i * 193.7 + 17) % W;
+    const sy = (i * 87.3 + 11) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.05 + (i % 6) * 0.03;
+    ctx.fillStyle = i % 5 === 0 ? "#ff80c0" : "#ffffff";
+    ctx.beginPath();
+    ctx.arc(sx, sy, i % 9 === 0 ? 1.0 : 0.45, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Outer border ─────────────────────────────────────────────────────────────
+  ctx.save();
+  roundedRect(ctx, 8, 8, W - 16, H - 16, 20);
+  const borderG = ctx.createLinearGradient(0, 0, W, H);
+  borderG.addColorStop(0, "#9b59b6");
+  borderG.addColorStop(0.5, "#e91e63aa");
+  borderG.addColorStop(1, "#9b59b6");
+  ctx.strokeStyle = borderG;
+  ctx.lineWidth = 2.5;
+  ctx.shadowBlur = 20;
+  ctx.shadowColor = "#9b59b6";
+  ctx.stroke();
+  ctx.restore();
+
+  // Inner subtle border
+  ctx.save();
+  roundedRect(ctx, 14, 14, W - 28, H - 28, 15);
+  ctx.strokeStyle = "rgba(255,255,255,0.05)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Vertical divider between avatar and stats ─────────────────────────────
+  const DIV_X = 270;
+  ctx.save();
+  const divG = ctx.createLinearGradient(DIV_X, 30, DIV_X, H - 30);
+  divG.addColorStop(0, "transparent");
+  divG.addColorStop(0.3, "rgba(155,80,210,0.35)");
+  divG.addColorStop(0.7, "rgba(233,30,99,0.25)");
+  divG.addColorStop(1, "transparent");
+  ctx.strokeStyle = divG;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(DIV_X, 30);
+  ctx.lineTo(DIV_X, H - 30);
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Avatar (left side) ───────────────────────────────────────────────────────
+  const AV_CX = 138, AV_CY = H / 2 - 12, AV_R = 90;
+  await drawAvatar(ctx, user.avatarUrl, AV_CX, AV_CY, AV_R, "#ffd700", "#ffb300", user.username[0]);
+
+  // ── Username below avatar ────────────────────────────────────────────────────
+  ctx.save();
+  ctx.font = `bold 15px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = "#ffd700";
+  ctx.fillText(truncate(user.username, 16), AV_CX, AV_CY + AV_R + 10);
+  ctx.restore();
+
+  // ── "PROFILE" pill above avatar ──────────────────────────────────────────────
+  ctx.save();
+  roundedRect(ctx, AV_CX - 38, AV_CY - AV_R - 32, 76, 22, 11);
+  ctx.fillStyle = "rgba(155,80,210,0.20)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(155,80,210,0.55)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+  ctx.save();
+  ctx.font = `bold 11px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#c084fc";
+  ctx.shadowBlur = 6;
+  ctx.shadowColor = "#9b59b6";
+  ctx.fillText("PROFILE CARD", AV_CX, AV_CY - AV_R - 21);
+  ctx.restore();
+
+  // ── Stats (right side) ───────────────────────────────────────────────────────
+  const SX = DIV_X + 30;
+  const statLineH = 48;
+  let sy = 55;
+
+  // Username header (big)
+  const nameG = ctx.createLinearGradient(SX, 0, SX + 400, 0);
+  nameG.addColorStop(0, "#ffffff");
+  nameG.addColorStop(0.6, "#e0b0ff");
+  nameG.addColorStop(1, "#ff80c0");
+  ctx.save();
+  ctx.font = `bold 28px "DejaVu"`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = nameG;
+  ctx.shadowBlur = 14;
+  ctx.shadowColor = "#9b59b6";
+  ctx.fillText(truncate(user.username, 18), SX, sy);
+  ctx.restore();
+  sy += 38;
+
+  // Thin separator under name
+  ctx.save();
+  const sepG = ctx.createLinearGradient(SX, 0, W - 30, 0);
+  sepG.addColorStop(0, "#9b59b655");
+  sepG.addColorStop(1, "transparent");
+  ctx.strokeStyle = sepG;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(SX, sy);
+  ctx.lineTo(W - 30, sy);
+  ctx.stroke();
+  ctx.restore();
+  sy += 18;
+
+  // Helper: draw one stat row
+  const drawStat = (icon: string, label: string, value: string, color: string) => {
+    // Icon pill
+    ctx.save();
+    roundedRect(ctx, SX, sy - 2, 28, 28, 8);
+    ctx.fillStyle = color + "22";
+    ctx.fill();
+    ctx.strokeStyle = color + "55";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+    ctx.save();
+    ctx.font = `16px "DejaVu"`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(icon, SX + 14, sy + 12);
+    ctx.restore();
+    // Label
+    ctx.save();
+    ctx.font = `11px "DejaVu"`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "rgba(255,255,255,0.38)";
+    ctx.fillText(label.toUpperCase(), SX + 36, sy);
+    ctx.restore();
+    // Value
+    ctx.save();
+    ctx.font = `bold 15px "DejaVu"`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#ffffff";
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = color;
+    ctx.fillText(value, SX + 36, sy + 12);
+    ctx.restore();
+  };
+
+  // Messages
+  drawStat(
+    "\u{1F4AC}",
+    "Messages",
+    messageCount.toLocaleString("en-IN"),
+    "#7289da"
+  );
+  sy += statLineH;
+
+  // Relationship status
+  const relStatus = spouseName
+    ? `Married to ${truncate(spouseName, 14)}`
+    : "Single \u{1F48B}";
+  drawStat("\u{1F495}", "Status", relStatus, "#e91e63");
+  sy += statLineH;
+
+  // Family
+  const familyStr =
+    parentsCount === 0 && childrenCount === 0
+      ? "No family yet"
+      : `${parentsCount} parent${parentsCount !== 1 ? "s" : ""} \u2022 ${childrenCount} kid${childrenCount !== 1 ? "s" : ""}`;
+  drawStat("\u{1F3E0}", "Family", familyStr, "#43b581");
+  sy += statLineH;
+
+  // Decorative bottom bar
+  ctx.save();
+  const barG = ctx.createLinearGradient(SX, 0, W - 30, 0);
+  barG.addColorStop(0, "#9b59b6");
+  barG.addColorStop(0.5, "#e91e63");
+  barG.addColorStop(1, "#9b59b6");
+  roundedRect(ctx, SX, H - 36, W - SX - 22, 4, 2);
+  ctx.fillStyle = barG;
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = "#e91e63";
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `11px "DejaVu"`;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillStyle = "rgba(255,255,255,0.22)";
+  ctx.fillText("Priya Bot", W - 28, H - 20);
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Ship card ────────────────────────────────────────────────────────────────
+
+export async function generateShipCard(user1: CardUser, user2: CardUser, percentage: number): Promise<Buffer> {
+  const W = 800, H = 310;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  // Rich dark purple/pink background
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#0d0521");
+  bg.addColorStop(0.35, "#1e073d");
+  bg.addColorStop(0.65, "#2d0a3a");
+  bg.addColorStop(1, "#0a0d21");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Center radial glow
+  const cg = ctx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, 220);
+  cg.addColorStop(0, "rgba(233,30,99,0.18)");
+  cg.addColorStop(1, "transparent");
+  ctx.fillStyle = cg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Star field
+  for (let i = 0; i < 90; i++) {
+    const sx = (i * 137.5 + 17) % W;
+    const sy = (i * 89.1 + 31) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.12 + (i % 5) * 0.06;
+    ctx.fillStyle = i % 5 === 0 ? "#ff80ab" : "#ffffff";
+    ctx.beginPath();
+    ctx.arc(sx, sy, i % 7 === 0 ? 1.5 : 0.7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Decorative sparkle stars
+  const sparks: [number, number, number][] = [[65, 45, 6], [735, 255, 5], [125, 255, 4], [675, 52, 5], [400, 22, 7]];
+  for (const [sx, sy, sr] of sparks) {
+    ctx.save();
+    ctx.fillStyle = "#ff80ab";
+    ctx.globalAlpha = 0.55;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = "#e91e63";
+    drawStar(ctx, sx, sy, 4, sr, sr * 0.4);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Title
+  ctx.save();
+  ctx.font = `bold 13px "DejaVu"`;
+  ctx.fillStyle = "rgba(255,255,255,0.28)";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText("S  H  I  P  P  I  N  G", W / 2, 16);
+  ctx.restore();
+
+  // Top decorative line
+  const lineGrad = ctx.createLinearGradient(100, 0, W - 100, 0);
+  lineGrad.addColorStop(0, "transparent");
+  lineGrad.addColorStop(0.5, "#e91e6355");
+  lineGrad.addColorStop(1, "transparent");
+  ctx.save();
+  ctx.strokeStyle = lineGrad;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(100, 38);
+  ctx.lineTo(W - 100, 38);
+  ctx.stroke();
+  ctx.restore();
+
+  const AV_R = 72;
+  const avCY = 160;
+
+  await drawAvatar(ctx, user1.avatarUrl, 135, avCY, AV_R, "#e91e63", "#ff4081", user1.username[0]);
+  await drawAvatar(ctx, user2.avatarUrl, W - 135, avCY, AV_R, "#e91e63", "#ff4081", user2.username[0]);
+
+  // Dashed connector line
+  ctx.save();
+  ctx.strokeStyle = "rgba(233,30,99,0.2)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 7]);
+  ctx.beginPath();
+  ctx.moveTo(135 + AV_R + 10, avCY);
+  ctx.lineTo(W - 135 - AV_R - 10, avCY);
+  ctx.stroke();
+  ctx.restore();
+
+  // Percentage
+  const pctColor = percentage >= 80 ? "#ff4081" : percentage >= 50 ? "#e91e63" : percentage >= 25 ? "#ab47bc" : "#7986cb";
+  ctx.save();
+  ctx.font = `bold 52px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowBlur = 24;
+  ctx.shadowColor = pctColor;
+  const pctGrad = ctx.createLinearGradient(W / 2 - 70, avCY - 50, W / 2 + 70, avCY);
+  pctGrad.addColorStop(0, "#ffffff");
+  pctGrad.addColorStop(0.5, pctColor);
+  pctGrad.addColorStop(1, "#ff80ab");
+  ctx.fillStyle = pctGrad;
+  ctx.fillText(`${percentage}%`, W / 2, avCY - 20);
+  ctx.restore();
+
+  // Love label
+  const loveLabel =
+    percentage >= 90 ? "Soulmates!" :
+    percentage >= 70 ? "Perfect Match!" :
+    percentage >= 50 ? "Strong Chemistry" :
+    percentage >= 30 ? "Something's There..." :
+    percentage >= 10 ? "Nahi Hoga Yaar" : "Bilkul Nahi!";
+
+  ctx.save();
+  ctx.font = `bold 13px "DejaVu"`;
+  ctx.fillStyle = pctColor + "bb";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(loveLabel, W / 2, avCY + 10);
+  ctx.restore();
+
+  // Progress bar
+  const BAR_W = 240, BAR_H = 14;
+  const BAR_X = (W - BAR_W) / 2, BAR_Y = avCY + 32;
+
+  roundedRect(ctx, BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2);
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  ctx.fill();
+
+  if (percentage > 0) {
+    const fillW = Math.max(BAR_W * (percentage / 100), BAR_H);
+    roundedRect(ctx, BAR_X, BAR_Y, fillW, BAR_H, BAR_H / 2);
+    const barGrad = ctx.createLinearGradient(BAR_X, 0, BAR_X + fillW, 0);
+    barGrad.addColorStop(0, "#7e57c2");
+    barGrad.addColorStop(0.4, "#e91e63");
+    barGrad.addColorStop(1, "#ff4081");
+    ctx.save();
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = "#e91e63";
+    ctx.fillStyle = barGrad;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Names
+  ctx.save();
+  ctx.font = `bold 17px "DejaVu"`;
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = "#e91e63";
+  ctx.fillText(truncate(user1.username, 13), 135, avCY + AV_R + 14);
+  ctx.fillText(truncate(user2.username, 13), W - 135, avCY + AV_R + 14);
+  ctx.restore();
+
+  // Bottom line
+  ctx.save();
+  ctx.strokeStyle = lineGrad;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(100, H - 22);
+  ctx.lineTo(W - 100, H - 22);
+  ctx.stroke();
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Marriage card ────────────────────────────────────────────────────────────
+
+export async function generateMarriageCard(user1: CardUser, user2: CardUser, marriedAt: Date): Promise<Buffer> {
+  const W = 800, H = 370;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  // Deep crimson/gold background
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#120308");
+  bg.addColorStop(0.3, "#240a10");
+  bg.addColorStop(0.6, "#1e0808");
+  bg.addColorStop(1, "#0e0205");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Gold glow corners
+  for (const [gx, gy] of [[0, 0], [W, 0], [0, H], [W, H]] as [number, number][]) {
+    const cg = ctx.createRadialGradient(gx, gy, 0, gx, gy, 260);
+    cg.addColorStop(0, "rgba(255,215,0,0.10)");
+    cg.addColorStop(1, "transparent");
+    ctx.fillStyle = cg;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Gold shimmer particles
+  for (let i = 0; i < 110; i++) {
+    const sx = (i * 211.3 + 50) % W;
+    const sy = (i * 97.7 + 20) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.08 + (i % 5) * 0.04;
+    ctx.fillStyle = i % 3 === 0 ? "#ffd700" : i % 3 === 1 ? "#ffec8b" : "#fff8dc";
+    ctx.beginPath();
+    ctx.arc(sx, sy, i % 7 === 0 ? 1.8 : 0.8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Outer double border
+  const borderGrad = ctx.createLinearGradient(0, 0, W, H);
+  borderGrad.addColorStop(0, "#ffd700");
+  borderGrad.addColorStop(0.25, "#ffec8b");
+  borderGrad.addColorStop(0.5, "#daa520");
+  borderGrad.addColorStop(0.75, "#ffec8b");
+  borderGrad.addColorStop(1, "#ffd700");
+
+  ctx.save();
+  roundedRect(ctx, 7, 7, W - 14, H - 14, 18);
+  ctx.strokeStyle = borderGrad;
+  ctx.lineWidth = 3;
+  ctx.shadowBlur = 16;
+  ctx.shadowColor = "#ffd700";
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  roundedRect(ctx, 13, 13, W - 26, H - 26, 14);
+  ctx.strokeStyle = "#ffd70030";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  // Corner ornaments
+  const corners: [number, number][] = [[32, 32], [W - 32, 32], [32, H - 32], [W - 32, H - 32]];
+  for (const [cx, cy] of corners) {
+    ctx.save();
+    ctx.fillStyle = "#ffd700";
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = "#ffd700";
+    drawStar(ctx, cx, cy, 4, 9, 4);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Title
+  const titleGrad = ctx.createLinearGradient(W / 2 - 220, 0, W / 2 + 220, 0);
+  titleGrad.addColorStop(0, "#b8860b");
+  titleGrad.addColorStop(0.3, "#ffd700");
+  titleGrad.addColorStop(0.6, "#ffec8b");
+  titleGrad.addColorStop(1, "#b8860b");
+  ctx.save();
+  ctx.font = `bold 28px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.shadowBlur = 18;
+  ctx.shadowColor = "#ffd700";
+  ctx.fillStyle = titleGrad;
+  ctx.fillText("MARRIAGE CERTIFICATE", W / 2, 28);
+  ctx.restore();
+
+  // Subtitle tagline
+  ctx.save();
+  ctx.font = `13px "DejaVu"`;
+  ctx.fillStyle = "rgba(255,215,0,0.45)";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText("Forever & Always", W / 2, 62);
+  ctx.restore();
+
+  // Separator
+  const sep = ctx.createLinearGradient(80, 0, W - 80, 0);
+  sep.addColorStop(0, "transparent");
+  sep.addColorStop(0.5, "#ffd70055");
+  sep.addColorStop(1, "transparent");
+  ctx.save();
+  ctx.strokeStyle = sep;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(80, 86);
+  ctx.lineTo(W - 80, 86);
+  ctx.stroke();
+  ctx.restore();
+
+  const AV_R = 82;
+  const avCY = 186;
+
+  await drawAvatar(ctx, user1.avatarUrl, 165, avCY, AV_R, "#ffd700", "#ffec8b", user1.username[0]);
+  await drawAvatar(ctx, user2.avatarUrl, W - 165, avCY, AV_R, "#ffd700", "#ffec8b", user2.username[0]);
+
+  // Center heart
+  ctx.save();
+  ctx.font = `bold 44px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowBlur = 28;
+  ctx.shadowColor = "#e91e63";
+  const hGrad = ctx.createLinearGradient(W / 2 - 30, avCY - 30, W / 2 + 30, avCY + 30);
+  hGrad.addColorStop(0, "#ff80ab");
+  hGrad.addColorStop(0.5, "#e91e63");
+  hGrad.addColorStop(1, "#ad1457");
+  ctx.fillStyle = hGrad;
+  ctx.fillText("♥", W / 2, avCY - 14);
+  ctx.restore();
+
+  // "&" under heart
+  ctx.save();
+  ctx.font = `bold 20px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255,215,0,0.55)";
+  ctx.fillText("&", W / 2, avCY + 22);
+  ctx.restore();
+
+  // Names
+  const nameGrad = ctx.createLinearGradient(0, 0, W, 0);
+  nameGrad.addColorStop(0, "#ffffff");
+  nameGrad.addColorStop(0.5, "#ffec8b");
+  nameGrad.addColorStop(1, "#ffffff");
+  ctx.save();
+  ctx.font = `bold 18px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = "#ffd700";
+  ctx.fillStyle = nameGrad;
+  ctx.fillText(truncate(user1.username, 14), 165, avCY + AV_R + 14);
+  ctx.fillText(truncate(user2.username, 14), W - 165, avCY + AV_R + 14);
+  ctx.restore();
+
+  // Bottom separator
+  ctx.save();
+  ctx.strokeStyle = sep;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(80, H - 54);
+  ctx.lineTo(W - 80, H - 54);
+  ctx.stroke();
+  ctx.restore();
+
+  // Date
+  const dateStr = marriedAt.toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" });
+  ctx.save();
+  ctx.font = `15px "DejaVu"`;
+  ctx.fillStyle = "rgba(255,215,0,0.50)";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`United on ${dateStr}`, W / 2, H - 22);
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Adopt card ───────────────────────────────────────────────────────────────
+
+export async function generateAdoptCard(parent: CardUser, child: CardUser): Promise<Buffer> {
+  const W = 800, H = 310;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  // Deep emerald background
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#030f07");
+  bg.addColorStop(0.4, "#071e0e");
+  bg.addColorStop(0.7, "#051408");
+  bg.addColorStop(1, "#021005");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Center radial glow
+  const cg = ctx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, 230);
+  cg.addColorStop(0, "rgba(67,181,129,0.14)");
+  cg.addColorStop(1, "transparent");
+  ctx.fillStyle = cg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Sparkle particles
+  for (let i = 0; i < 90; i++) {
+    const sx = (i * 173.1 + 40) % W;
+    const sy = (i * 113.7 + 20) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.10 + (i % 4) * 0.05;
+    ctx.fillStyle = i % 3 === 0 ? "#43b581" : i % 3 === 1 ? "#ffd700" : "#7effd4";
+    ctx.beginPath();
+    ctx.arc(sx, sy, i % 6 === 0 ? 1.4 : 0.7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Ornate border
+  const borderGrad = ctx.createLinearGradient(0, 0, W, H);
+  borderGrad.addColorStop(0, "#43b581");
+  borderGrad.addColorStop(0.3, "#7effd4");
+  borderGrad.addColorStop(0.6, "#2ecc71");
+  borderGrad.addColorStop(1, "#43b581");
+  ctx.save();
+  roundedRect(ctx, 7, 7, W - 14, H - 14, 18);
+  ctx.strokeStyle = borderGrad;
+  ctx.lineWidth = 2.5;
+  ctx.shadowBlur = 14;
+  ctx.shadowColor = "#43b581";
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  roundedRect(ctx, 13, 13, W - 26, H - 26, 13);
+  ctx.strokeStyle = "#43b58128";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  // Corner stars
+  const corners: [number, number][] = [[30, 30], [W - 30, 30], [30, H - 30], [W - 30, H - 30]];
+  for (const [cx, cy] of corners) {
+    ctx.save();
+    ctx.fillStyle = "#43b581";
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = "#43b581";
+    drawStar(ctx, cx, cy, 4, 7.5, 3.2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Title
+  const titleGrad = ctx.createLinearGradient(W / 2 - 200, 0, W / 2 + 200, 0);
+  titleGrad.addColorStop(0, "#2ecc71");
+  titleGrad.addColorStop(0.4, "#7effd4");
+  titleGrad.addColorStop(0.6, "#43b581");
+  titleGrad.addColorStop(1, "#2ecc71");
+  ctx.save();
+  ctx.font = `bold 26px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.shadowBlur = 14;
+  ctx.shadowColor = "#43b581";
+  ctx.fillStyle = titleGrad;
+  ctx.fillText("ADOPTION CERTIFICATE", W / 2, 24);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `13px "DejaVu"`;
+  ctx.fillStyle = "rgba(67,181,129,0.45)";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText("Welcome to the Family!", W / 2, 58);
+  ctx.restore();
+
+  // Separator
+  const sep = ctx.createLinearGradient(80, 0, W - 80, 0);
+  sep.addColorStop(0, "transparent");
+  sep.addColorStop(0.5, "#43b58150");
+  sep.addColorStop(1, "transparent");
+  ctx.save();
+  ctx.strokeStyle = sep;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(80, 82);
+  ctx.lineTo(W - 80, 82);
+  ctx.stroke();
+  ctx.restore();
+
+  const AV_R = 74;
+  const avCY = 178;
+
+  // Role badges
+  const drawBadge = (label: string, bx: number, by: number, color: string) => {
+    const bw = 70, bh = 20;
+    ctx.save();
+    roundedRect(ctx, bx - bw / 2, by, bw, bh, 10);
+    ctx.fillStyle = color + "22";
+    ctx.fill();
+    ctx.strokeStyle = color + "66";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+    ctx.save();
+    ctx.font = `bold 11px "DejaVu"`;
+    ctx.fillStyle = color;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowBlur = 5;
+    ctx.shadowColor = color;
+    ctx.fillText(label, bx, by + 10);
+    ctx.restore();
+  };
+
+  drawBadge("PARENT", 155, avCY - AV_R - 28, "#43b581");
+  drawBadge("CHILD", W - 155, avCY - AV_R - 28, "#ffd700");
+
+  await drawAvatar(ctx, parent.avatarUrl, 155, avCY, AV_R, "#43b581", "#7effd4", parent.username[0]);
+  await drawAvatar(ctx, child.avatarUrl, W - 155, avCY, AV_R, "#ffd700", "#ffec8b", child.username[0]);
+
+  // Dashed connector
+  ctx.save();
+  ctx.strokeStyle = "rgba(67,181,129,0.22)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 6]);
+  ctx.beginPath();
+  ctx.moveTo(155 + AV_R + 10, avCY);
+  ctx.lineTo(W - 155 - AV_R - 10, avCY);
+  ctx.stroke();
+  ctx.restore();
+
+  // Center home icon text
+  ctx.save();
+  ctx.font = `bold 26px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowBlur = 16;
+  ctx.shadowColor = "#43b581";
+  const hGrad = ctx.createLinearGradient(W / 2 - 30, avCY - 20, W / 2 + 30, avCY + 20);
+  hGrad.addColorStop(0, "#7effd4");
+  hGrad.addColorStop(0.5, "#43b581");
+  hGrad.addColorStop(1, "#2ecc71");
+  ctx.fillStyle = hGrad;
+  ctx.fillText("HOME", W / 2, avCY - 12);
+  ctx.restore();
+  ctx.save();
+  ctx.font = `14px "DejaVu"`;
+  ctx.fillStyle = "rgba(67,181,129,0.55)";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("SWEET", W / 2, avCY + 14);
+  ctx.restore();
+
+  // Names
+  ctx.save();
+  ctx.font = `bold 17px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = "#43b581";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(truncate(parent.username, 13), 155, avCY + AV_R + 14);
+  ctx.restore();
+  ctx.save();
+  ctx.font = `bold 17px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = "#ffd700";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(truncate(child.username, 13), W - 155, avCY + AV_R + 14);
+  ctx.restore();
+
+  // Bottom line
+  ctx.save();
+  ctx.strokeStyle = sep;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(80, H - 22);
+  ctx.lineTo(W - 80, H - 22);
+  ctx.stroke();
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Family card ──────────────────────────────────────────────────────────────
+
+export interface FamilyChildNode {
+  user: CardUser;
+  spouse: CardUser | null;
+  children: FamilyChildNode[];
+}
+
+export interface FamilyTreeData {
+  user: CardUser;
+  grandparents: CardUser[];
+  parents: CardUser[];
+  spouse: CardUser | null;
+  spouseMarriedAt: Date | null;
+  children: FamilyChildNode[];
+  totalMembers: number;
+  generations: number;
+}
+
+export async function generateFamilyCard(data: FamilyTreeData): Promise<Buffer> {
+  const { user, grandparents, parents, spouse, spouseMarriedAt, children, totalMembers, generations } = data;
+
+  const MARGIN = 48;
+
+  // ── Recursive tree layout ────────────────────────────────────────────────
+
+  interface LayoutNode {
+    user: CardUser;
+    spouse: CardUser | null;
+    children: LayoutNode[];
+    subWidth: number;
+    x: number;
+    y: number;
+    r: number;
+    depth: number;
+  }
+
+  const BASE_R = 50;
+  const MIN_R  = 12;
+  const COUPLE_GAP = 50;
+  const CHILD_GAP = 12;
+  const LEVEL_GAP = 54;
+
+  function buildLayout(node: FamilyChildNode, depth: number): LayoutNode {
+    const childLayouts = node.children.map((c) => buildLayout(c, depth + 1));
+    const r = Math.max(MIN_R, BASE_R - depth * 7);
+    const coupleW = node.spouse ? 2 * r + COUPLE_GAP : 2 * r;
+    if (childLayouts.length === 0) {
+      return { ...node, children: childLayouts, subWidth: coupleW + 10, x: 0, y: 0, r, depth };
+    }
+    const childSubW = childLayouts.reduce((s, c) => s + c.subWidth, 0) + (childLayouts.length - 1) * CHILD_GAP;
+    return { ...node, children: childLayouts, subWidth: Math.max(coupleW + 10, childSubW), x: 0, y: 0, r, depth };
+  }
+
+  const childLayouts = children.map((c) => buildLayout(c, 3));
+
+  // Position tree: assign x,y to each node
+  function positionNode(n: LayoutNode, cx: number, y: number) {
+    n.x = cx;
+    n.y = y;
+    if (n.children.length === 0) return;
+    const totalW = n.children.reduce((s, c) => s + c.subWidth, 0) + (n.children.length - 1) * CHILD_GAP;
+    let curX = cx - totalW / 2 + n.children[0].subWidth / 2;
+    for (const ch of n.children) {
+      positionNode(ch, curX, y + n.r + LEVEL_GAP);
+      curX += ch.subWidth + CHILD_GAP;
+    }
+  }
+
+  // Top rows: grandparents, parents, user
+  const U_R = BASE_R;
+  const SPOUSE_R = U_R - 4;
+  const gpShow = Math.min(grandparents.length, 6);
+  const pShow  = Math.min(parents.length, 4);
+
+  const USER_Y = 215 + (gpShow > 0 ? 44 : 0);
+  const USER_X = spouse ? 320 : 300;
+
+  // ── Calculate canvas dimensions ──────────────────────────────────────────
+  function treeDepth(n: LayoutNode): number {
+    if (n.children.length === 0) return 1;
+    return 1 + Math.max(...n.children.map(treeDepth));
+  }
+  const maxDepth = Math.max(1, ...childLayouts.map(treeDepth));
+  const childTreeBottom = childLayouts.length > 0
+    ? USER_Y + U_R + LEVEL_GAP + maxDepth * (LEVEL_GAP + MIN_R)
+    : USER_Y;
+
+  const userLeft  = spouse ? USER_X - U_R : USER_X;
+  const userRight = spouse ? 320 + SPOUSE_R : USER_X + U_R;
+  const gpRight   = gpShow > 0 ? W - MARGIN : userRight;
+  const totalTreeW = childLayouts.length > 0
+    ? childLayouts.reduce((s, c) => s + c.subWidth, 0) + (childLayouts.length - 1) * CHILD_GAP
+    : 0;
+
+  const W = Math.max(900, gpRight + MARGIN, userRight + MARGIN, (gpShow > 0 ? 800 : 600), totalTreeW + 2 * MARGIN);
+
+  // Position child tree
+  const treeLeft = Math.max(MARGIN, (W - totalTreeW) / 2);
+  const treeTopY = USER_Y + U_R + LEVEL_GAP;
+  if (childLayouts.length > 0) {
+    let curX = treeLeft + childLayouts[0].subWidth / 2;
+    for (const ch of childLayouts) {
+      positionNode(ch, curX, treeTopY);
+      curX += ch.subWidth + CHILD_GAP;
+    }
+  }
+
+  const H = Math.max(600, childTreeBottom + LEVEL_GAP + 50 + (gpShow > 0 ? 20 : 0));
+
+  // ── Top row X positions ─────────────────────────────────────────────────
+  const gpXs: number[] = [];
+  if (gpShow > 0) {
+    const gpMargin = Math.min(Math.max(MARGIN, (W - 2 * MARGIN) / (gpShow + 1)), 120);
+    const spacing = (W - 2 * gpMargin) / (gpShow - 1);
+    for (let i = 0; i < gpShow; i++) gpXs.push(gpMargin + i * spacing);
+  }
+  const pXs: number[] = [];
+  if (pShow > 0) {
+    const pMargin = Math.min(Math.max(MARGIN + 60, (W - 2 * MARGIN) / (pShow + 1)), 160);
+    const spacing = (W - 2 * pMargin) / (pShow - 1);
+    for (let i = 0; i < pShow; i++) pXs.push(pMargin + i * spacing);
+  }
+
+  // ── Canvas ────────────────────────────────────────────────────────────────
+  const canvas = createCanvas(W, H);
+  const ctx    = canvas.getContext("2d");
+
+  // Background
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0,   "#1a0a15");
+  bg.addColorStop(0.25, "#2d1225");
+  bg.addColorStop(0.5, "#3a1628");
+  bg.addColorStop(0.75, "#2d1225");
+  bg.addColorStop(1,   "#1a0a15");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  const ag = ctx.createRadialGradient(W / 2, H / 2, 30, W / 2, H / 2, Math.max(W, H) * 0.5);
+  ag.addColorStop(0, "rgba(255,105,180,0.12)");
+  ag.addColorStop(0.4, "rgba(255,182,193,0.06)");
+  ag.addColorStop(1, "transparent");
+  ctx.fillStyle = ag;
+  ctx.fillRect(0, 0, W, H);
+
+  // Cherry blossom petals and sparkles
+  for (let i = 0; i < 100; i++) {
+    const sx = (i * 157.3 + 23) % W;
+    const sy = (i * 93.7  + 11) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.04 + (i % 5) * 0.025;
+    if (i % 7 === 0) {
+      ctx.fillStyle = "#ffb7c5";
+      ctx.beginPath();
+      ctx.ellipse(sx, sy, 3, 1.5, i * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = i % 5 === 0 ? "#ff80bf" : i % 5 === 2 ? "#ffb3d9" : "#ffffff";
+      ctx.beginPath();
+      ctx.arc(sx, sy, i % 11 === 0 ? 1.5 : 0.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Outer border
+  ctx.save();
+  roundedRect(ctx, 10, 10, W - 20, H - 20, 22);
+  ctx.fillStyle = "rgba(255,255,255,0.02)";
+  ctx.fill();
+  const borderG = ctx.createLinearGradient(0, 0, W, H);
+  borderG.addColorStop(0,   "#ff69b4");
+  borderG.addColorStop(0.3, "#ffb6c1");
+  borderG.addColorStop(0.7, "#ff69b4");
+  borderG.addColorStop(1,   "#ff1493");
+  ctx.strokeStyle = borderG;
+  ctx.lineWidth   = 2.5;
+  ctx.shadowBlur  = 22;
+  ctx.shadowColor = "#ff69b4";
+  ctx.stroke();
+  ctx.restore();
+
+  // Title
+  ctx.save();
+  const titleG = ctx.createLinearGradient(W / 2 - 220, 0, W / 2 + 220, 0);
+  titleG.addColorStop(0,   "#ff69b4");
+  titleG.addColorStop(0.3, "#ffb6c1");
+  titleG.addColorStop(0.6, "#ffffff");
+  titleG.addColorStop(0.8, "#ffb6c1");
+  titleG.addColorStop(1,   "#ff69b4");
+  ctx.font          = `bold 22px "DejaVu"`;
+  ctx.textAlign     = "center";
+  ctx.textBaseline  = "middle";
+  ctx.shadowBlur    = 16;
+  ctx.shadowColor   = "#ff69b4";
+  ctx.fillStyle     = titleG;
+  ctx.fillText(`${truncate(user.username, 18)}'s Family Tree`, W / 2, 24);
+  ctx.restore();
+
+  // Stats bar
+  const statsY = 44;
+  ctx.save();
+  const statsG = ctx.createLinearGradient(W / 2 - 200, 0, W / 2 + 200, 0);
+  statsG.addColorStop(0, "rgba(255,105,180,0.15)");
+  statsG.addColorStop(0.5, "rgba(255,182,193,0.12)");
+  statsG.addColorStop(1, "rgba(255,105,180,0.15)");
+  roundedRect(ctx, W / 2 - 200, statsY - 10, 400, 22, 11);
+  ctx.fillStyle = statsG;
+  ctx.fill();
+  ctx.restore();
+  ctx.save();
+  ctx.font          = `10px "DejaVu"`;
+  ctx.textAlign     = "center";
+  ctx.textBaseline  = "middle";
+  ctx.fillStyle     = "rgba(255,182,193,0.55)";
+  ctx.fillText(`👥 ${totalMembers} members  •  📊 ${generations} generations${spouseMarriedAt ? `  •  💍 Married ${Math.floor((Date.now() - spouseMarriedAt.getTime()) / (1000 * 60 * 60 * 24))}d` : ""}`, W / 2, statsY + 1);
+  ctx.restore();
+
+  // Separator
+  ctx.save();
+  const sepG = ctx.createLinearGradient(100, 0, W - 100, 0);
+  sepG.addColorStop(0, "transparent");
+  sepG.addColorStop(0.5, "rgba(255,105,180,0.25)");
+  sepG.addColorStop(1, "transparent");
+  ctx.strokeStyle = sepG;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(100, 64);
+  ctx.lineTo(W - 100, 64);
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const PINK      = "rgba(255,105,180,0.70)";
+  const PINK_GLOW = "#ff69b4";
+
+  function drawLine(x1: number, y1: number, x2: number, y2: number, dashed = false, color = PINK) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 1.8;
+    ctx.shadowBlur  = 4;
+    ctx.shadowColor = color;
+    if (dashed) ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  async function drawNode(
+    u: CardUser, cx: number, cy: number, r: number,
+    ring: string, glow: string, nameColor = "#ffb6c1", bold = false
+  ) {
+    await drawAvatar(ctx, u.avatarUrl, cx, cy, r, glow, ring, u.username[0]);
+    ctx.save();
+    ctx.font         = `${bold ? "bold " : ""}${bold ? 12 : 10}px "DejaVu"`;
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "top";
+    ctx.fillStyle    = nameColor;
+    ctx.shadowBlur   = bold ? 8 : 4;
+    ctx.shadowColor  = ring;
+    ctx.fillText(truncate(u.username, bold ? 14 : 9), cx, cy + r + 4);
+    ctx.restore();
+  }
+
+  // ── Ring color by depth ──────────────────────────────────────────────────
+  const RING_COLORS = [
+    { ring: "#ff69b4", glow: "#ff1493", label: "HOT PINK" },  // user (depth 2)
+    { ring: "#f06292", glow: "#ec407a", label: "PINK" },       // children (depth 3)
+    { ring: "#f48fb1", glow: "#f06292", label: "LIGHT PINK" }, // grandchildren (depth 4)
+    { ring: "#f8bbd0", glow: "#f48fb1", label: "PALE PINK" },  // great-grandchildren (depth 5)
+    { ring: "#fce4ec", glow: "#f8bbd0", label: "BLUSH" },      // depth 6+
+  ];
+
+  function getColors(depth: number) {
+    const idx = Math.min(depth - 3, RING_COLORS.length - 1);
+    return RING_COLORS[idx];
+  }
+
+  // ── Recursive node drawing ──────────────────────────────────────────────
+  async function drawSubtree(n: LayoutNode) {
+    const col = getColors(n.depth);
+    await drawNode(n.user, n.x, n.y, n.r, col.ring, col.glow);
+
+    if (n.spouse) {
+      const sx = n.x + n.r + COUPLE_GAP / 2;
+      await drawNode(n.spouse, sx, n.y, n.r - 2, "#e91e63", "#ff4081", "#ffb3c6");
+      drawLine(n.x + n.r + 4, n.y, sx - n.r + 2, n.y, false, "rgba(233,30,99,0.7)");
+      ctx.save();
+      ctx.font         = `12px "DejaVu"`;
+      ctx.textAlign    = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle    = "#e91e63";
+      ctx.shadowBlur   = 8;
+      ctx.shadowColor  = "#ff4081";
+      ctx.fillText("♥", (n.x + n.r + 4 + sx - n.r + 2) / 2, n.y - 2);
+      ctx.restore();
+    }
+
+    if (n.children.length === 0) return;
+
+    const coupleCenterX = n.spouse
+      ? (n.x + n.x + n.r + COUPLE_GAP / 2) / 2
+      : n.x;
+
+    // Vertical line from parent to child rail
+    const railY = n.y + n.r + 16;
+    drawLine(coupleCenterX, n.y + n.r + 3, coupleCenterX, railY, true);
+
+    // Horizontal rail connecting children
+    const firstCX = n.children[0].x;
+    const lastCX  = n.children[n.children.length - 1].x;
+    if (n.children.length > 1 || Math.abs(firstCX - coupleCenterX) > 4) {
+      const railL = Math.min(coupleCenterX, firstCX);
+      const railR = Math.max(coupleCenterX, lastCX);
+      drawLine(railL, railY, railR, railY);
+    }
+
+    // Vertical lines down to each child
+    for (const ch of n.children) {
+      drawLine(ch.x, railY, ch.x, ch.y - ch.r - 3, true);
+    }
+
+    // Recurse to children
+    for (const ch of n.children) {
+      await drawSubtree(ch);
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // DRAW CONNECTOR LINES (top rows)
+  // ═════════════════════════════════════════════════════════════════════════
+
+  const GP_R = 20;
+  const GP_Y = 92;
+  const P_R  = 30;
+  const P_Y  = 176;
+
+  // Grandparents → Parents
+  if (gpShow > 0 && pShow > 0) {
+    const GP_RAIL = GP_Y + GP_R + 10;
+    const P_RAIL  = P_Y - P_R - 10;
+    for (const gx of gpXs) drawLine(gx, GP_Y + GP_R + 2, gx, GP_RAIL);
+    if (gpShow > 1) drawLine(gpXs[0], GP_RAIL, gpXs[gpShow - 1], GP_RAIL);
+    for (const px of pXs) drawLine(px, P_RAIL, px, P_Y - P_R - 2);
+    if (pShow > 1)  drawLine(pXs[0], P_RAIL, pXs[pShow - 1], P_RAIL);
+    const gpCX = gpShow === 1 ? gpXs[0] : (gpXs[0] + gpXs[gpShow - 1]) / 2;
+    const pCX  = pShow  === 1 ? pXs[0]  : (pXs[0]  + pXs[pShow  - 1]) / 2;
+    drawLine(gpCX, GP_RAIL, pCX, P_RAIL);
+  }
+
+  // Parents → User
+  if (pShow > 0) {
+    const P_RAIL = P_Y + P_R + 12;
+    for (const px of pXs) drawLine(px, P_Y + P_R + 2, px, P_RAIL);
+    if (pShow > 1) drawLine(pXs[0], P_RAIL, pXs[pShow - 1], P_RAIL);
+    const pCX = pShow === 1 ? pXs[0] : (pXs[0] + pXs[pShow - 1]) / 2;
+    drawLine(pCX, P_RAIL, USER_X, USER_Y - U_R - 4, true);
+  }
+
+  // User ↔ Spouse
+  if (spouse) {
+    const SPOUSE_X = USER_X + U_R + COUPLE_GAP + SPOUSE_R;
+    drawLine(USER_X + U_R + 4, USER_Y, SPOUSE_X - SPOUSE_R - 4, USER_Y, false, "rgba(233,30,99,0.85)");
+    ctx.save();
+    ctx.font         = `14px "DejaVu"`;
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle    = "#e91e63";
+    ctx.shadowBlur   = 10;
+    ctx.shadowColor  = "#ff4081";
+    ctx.fillText("💍", (USER_X + U_R + 4 + SPOUSE_X - SPOUSE_R - 4) / 2, USER_Y - 2);
+    ctx.restore();
+  }
+
+  // User/Couple → first child level
+  if (childLayouts.length > 0) {
+    const coupleCenterX = spouse
+      ? (USER_X + USER_X + U_R + COUPLE_GAP) / 2
+      : USER_X;
+    const railY = USER_Y + U_R + 16;
+    drawLine(coupleCenterX, USER_Y + U_R + 3, coupleCenterX, railY, true);
+    const firstCX = childLayouts[0].x;
+    const lastCX  = childLayouts[childLayouts.length - 1].x;
+    if (childLayouts.length > 1 || Math.abs(firstCX - coupleCenterX) > 4) {
+      const railL = Math.min(coupleCenterX, firstCX);
+      const railR = Math.max(coupleCenterX, lastCX);
+      drawLine(railL, railY, railR, railY);
+    }
+    for (const ch of childLayouts) {
+      drawLine(ch.x, railY, ch.x, ch.y - ch.r - 3, true);
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // DRAW AVATARS
+  // ═════════════════════════════════════════════════════════════════════════
+
+  // Grandparents
+  for (let i = 0; i < gpShow; i++)
+    await drawNode(grandparents[i], gpXs[i], GP_Y, GP_R, "#f8b4c8", "#f48fb1");
+
+  // Parents
+  for (let i = 0; i < pShow; i++)
+    await drawNode(parents[i], pXs[i], P_Y, P_R, "#f48fb1", "#ec407a");
+
+  // User
+  await drawNode(user, USER_X, USER_Y, U_R, "#ff69b4", "#ff1493", "#ffffff", true);
+
+  // Spouse
+  if (spouse) {
+    const SPOUSE_X = USER_X + U_R + COUPLE_GAP + SPOUSE_R;
+    await drawNode(spouse, SPOUSE_X, USER_Y, SPOUSE_R, "#e91e63", "#ff4081", "#ffb3c6");
+  }
+
+  // Children subtree (recursive)
+  for (const ch of childLayouts) {
+    await drawSubtree(ch);
+  }
+
+  // ── Row labels ──────────────────────────────────────────────────────────────
+  function rowLabel(text: string, y: number, color: string) {
+    ctx.save();
+    ctx.font         = `8px "DejaVu"`;
+    ctx.fillStyle    = color;
+    ctx.textAlign    = "left";
+    ctx.textBaseline = "middle";
+    ctx.globalAlpha  = 0.35;
+    ctx.fillText(text, 14, y);
+    ctx.restore();
+  }
+
+  if (gpShow > 0)  rowLabel("GRANDPARENTS", GP_Y, "#f8b4c8");
+  if (pShow  > 0)  rowLabel("PARENTS",      P_Y,  "#f48fb1");
+  rowLabel("YOU", USER_Y, "#ff69b4");
+  if (childLayouts.length > 0) rowLabel("CHILDREN", childLayouts[0].y, "#f06292");
+
+  // ── Overflow hints ──────────────────────────────────────────────────────────
+  function overflowHint(total: number, shown: number, y: number, color: string) {
+    if (total <= shown) return;
+    ctx.save();
+    ctx.font         = `9px "DejaVu"`;
+    ctx.fillStyle    = color;
+    ctx.textAlign    = "right";
+    ctx.textBaseline = "middle";
+    ctx.globalAlpha  = 0.6;
+    ctx.fillText(`+${total - shown} more`, W - 16, y);
+    ctx.restore();
+  }
+  overflowHint(grandparents.length, 6, GP_Y, "#f8b4c8");
+  overflowHint(parents.length, 4, P_Y, "#f48fb1");
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Live Message Counter Card ────────────────────────────────────────────────
+
+export interface CounterMember {
+  userId: string;
+  username: string;
+  avatarUrl?: string;
+  messageCount: number;
+}
+
+export async function generateCounterCard(opts: {
+  guildName: string;
+  guildIconUrl?: string;
+  totalMessages: number;
+  memberCount: number;
+  botCount: number;
+  updatedAt: Date;
+  topMembers: CounterMember[];
+}): Promise<Buffer> {
+  const ROW_H = 46;
+  const HEADER_H = 100;
+  const FOOTER_H = 32;
+  const TOP = opts.topMembers.slice(0, 10);
+  const W = 900;
+  const H = HEADER_H + Math.max(TOP.length, 1) * ROW_H + FOOTER_H;
+
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  // ── Background ─────────────────────────────────────────────────────────────
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0,   "#06000f");
+  bg.addColorStop(0.5, "#0b0018");
+  bg.addColorStop(1,   "#050010");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Nebula glows
+  for (const [gx, gy, gr, gc] of [
+    [160,     H * 0.4, 280, "rgba(100,0,220,0.14)"],
+    [W - 120, H * 0.3, 200, "rgba(0,160,255,0.10)"],
+    [W * 0.5, H * 0.8, 180, "rgba(180,0,255,0.08)"],
+  ] as [number,number,number,string][]) {
+    const g = ctx.createRadialGradient(gx, gy, 8, gx, gy, gr);
+    g.addColorStop(0, gc); g.addColorStop(1, "transparent");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+
+  // Stars
+  for (let i = 0; i < 70; i++) {
+    const sx = (i * 211.3 + 17) % W;
+    const sy = (i * 97.7  + 5)  % H;
+    ctx.save();
+    ctx.globalAlpha = 0.04 + (i % 6) * 0.04;
+    ctx.fillStyle = i % 3 === 0 ? "#bf80ff" : i % 3 === 1 ? "#80cfff" : "#ffffff";
+    ctx.beginPath();
+    ctx.arc(sx, sy, i % 13 === 0 ? 1.2 : 0.45, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Outer border
+  ctx.save();
+  roundedRect(ctx, 7, 7, W - 14, H - 14, 20);
+  const brdG = ctx.createLinearGradient(0, 0, W, H);
+  brdG.addColorStop(0,   "#7b00ff");
+  brdG.addColorStop(0.5, "#00b4ff77");
+  brdG.addColorStop(1,   "#7b00ff");
+  ctx.strokeStyle = brdG;
+  ctx.lineWidth = 2;
+  ctx.shadowBlur = 18;
+  ctx.shadowColor = "#7b00ff";
+  ctx.stroke();
+  ctx.restore();
+
+  // ── LEFT PANEL — server info ───────────────────────────────────────────────
+  const LEFT_W = 210, DIV_X = LEFT_W;
+  const ICON_CX = LEFT_W / 2, ICON_CY = 52, ICON_R = 34;
+
+  await drawAvatar(ctx, opts.guildIconUrl, ICON_CX, ICON_CY, ICON_R, "#7b00ff", "#00b4ff", opts.guildName[0]);
+
+  ctx.save();
+  ctx.font = `bold 12px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#d4aaff";
+  ctx.shadowBlur = 6; ctx.shadowColor = "#7b00ff";
+  ctx.fillText(truncate(opts.guildName, 16), ICON_CX, ICON_CY + ICON_R + 6);
+  ctx.restore();
+
+  // Mini stat pills
+  const miniStats = [
+    { label: "Total Messages", value: opts.totalMessages.toLocaleString() },
+    { label: "Members",        value: (opts.memberCount - opts.botCount).toLocaleString() },
+  ];
+  let msy = ICON_CY + ICON_R + 24;
+  for (const ms of miniStats) {
+    ctx.save();
+    roundedRect(ctx, 16, msy, LEFT_W - 32, 28, 8);
+    ctx.fillStyle = "rgba(120,0,255,0.14)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(120,0,255,0.25)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.font = `bold 12px "DejaVu"`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    const mg = ctx.createLinearGradient(16, 0, LEFT_W - 16, 0);
+    mg.addColorStop(0, "#bf80ff"); mg.addColorStop(1, "#80cfff");
+    ctx.fillStyle = mg;
+    ctx.shadowBlur = 5; ctx.shadowColor = "#7b00ff";
+    ctx.fillText(ms.value, LEFT_W / 2, msy + 9);
+    ctx.restore();
+
+    ctx.save();
+    ctx.font = `8px "DejaVu"`;
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillStyle = "rgba(200,180,255,0.40)";
+    ctx.fillText(ms.label, LEFT_W / 2, msy + 26);
+    ctx.restore();
+
+    msy += 33;
+  }
+
+  // LIVE pill
+  const PILL_W = 46, PILL_H = 17;
+  const PILL_X = LEFT_W / 2 - PILL_W / 2, PILL_Y = msy + 4;
+  ctx.save();
+  roundedRect(ctx, PILL_X, PILL_Y, PILL_W, PILL_H, 9);
+  ctx.fillStyle = "rgba(255,50,50,0.20)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,80,80,0.50)";
+  ctx.lineWidth = 1; ctx.stroke();
+  ctx.restore();
+  ctx.save();
+  ctx.font = `bold 8px "DejaVu"`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ff8080"; ctx.shadowBlur = 5; ctx.shadowColor = "#ff4040";
+  ctx.fillText("\u25CF  LIVE", LEFT_W / 2, PILL_Y + PILL_H / 2);
+  ctx.restore();
+
+  // Vertical divider
+  ctx.save();
+  const divG = ctx.createLinearGradient(DIV_X, 20, DIV_X, H - 20);
+  divG.addColorStop(0, "transparent");
+  divG.addColorStop(0.25, "rgba(120,0,255,0.40)");
+  divG.addColorStop(0.75, "rgba(0,180,255,0.25)");
+  divG.addColorStop(1, "transparent");
+  ctx.strokeStyle = divG; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(DIV_X, 20); ctx.lineTo(DIV_X, H - 20); ctx.stroke();
+  ctx.restore();
+
+  // ── RIGHT PANEL — leaderboard ──────────────────────────────────────────────
+  const RX = DIV_X + 14, RW = W - RX - 14;
+
+  // "TOP CHATTERS" header
+  ctx.save();
+  ctx.font = `bold 11px "DejaVu"`;
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(191,128,255,0.60)";
+  ctx.fillText("\uD83C\uDFC6  TOP CHATTERS", RX + 2, 18);
+  ctx.restore();
+
+  // Header separator
+  ctx.save();
+  const hG = ctx.createLinearGradient(RX, 0, RX + RW, 0);
+  hG.addColorStop(0, "rgba(120,0,255,0.50)");
+  hG.addColorStop(1, "rgba(0,180,255,0.20)");
+  ctx.strokeStyle = hG; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(RX, 28); ctx.lineTo(RX + RW, 28); ctx.stroke();
+  ctx.restore();
+
+  // Column labels
+  ctx.save();
+  ctx.font = `8px "DejaVu"`;
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(191,128,255,0.38)";
+  ctx.textAlign = "left";  ctx.fillText("#",       RX + 6,  42);
+  ctx.textAlign = "left";  ctx.fillText("MEMBER",  RX + 76, 42);
+  ctx.textAlign = "right"; ctx.fillText("MESSAGES",RX + RW, 42);
+  ctx.restore();
+
+  const maxCount = TOP[0]?.messageCount || 1;
+  const MEDAL    = ["#FFD700","#C0C0C0","#CD7F32"];
+  const AV_R     = 16;
+  const BAR_START = RX + 260;
+  const BAR_W     = RX + RW - 70 - BAR_START;
+
+  for (let i = 0; i < TOP.length; i++) {
+    const m   = TOP[i];
+    const ry  = HEADER_H + i * ROW_H;
+    const rCY = ry + ROW_H / 2;
+
+    // Alternating row bg
+    if (i % 2 === 0) {
+      ctx.save();
+      roundedRect(ctx, RX, ry + 3, RW, ROW_H - 6, 7);
+      ctx.fillStyle = "rgba(120,0,255,0.06)";
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Rank
+    const rankColor = i < 3 ? MEDAL[i] : "rgba(180,140,255,0.55)";
+    ctx.save();
+    ctx.font = i < 3 ? `bold 14px "DejaVu"` : `12px "DejaVu"`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = rankColor;
+    if (i < 3) { ctx.shadowBlur = 10; ctx.shadowColor = rankColor; }
+    ctx.fillText(`${i + 1}`, RX + 18, rCY);
+    ctx.restore();
+
+    // Avatar
+    await drawAvatar(ctx, m.avatarUrl, RX + 48, rCY, AV_R,
+      i < 3 ? MEDAL[i] : "#7b00ff",
+      i < 3 ? MEDAL[i] : "#00b4ff",
+      m.username[0]);
+
+    // Name
+    ctx.save();
+    ctx.font = i < 3 ? `bold 13px "DejaVu"` : `12px "DejaVu"`;
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillStyle = i < 3 ? "#ffffff" : "rgba(230,210,255,0.85)";
+    if (i < 3) { ctx.shadowBlur = 6; ctx.shadowColor = MEDAL[i]; }
+    ctx.fillText(truncate(m.username, 18), RX + 74, rCY);
+    ctx.restore();
+
+    // Progress bar track
+    ctx.save();
+    roundedRect(ctx, BAR_START, rCY - 5, BAR_W, 10, 5);
+    ctx.fillStyle = "rgba(120,0,255,0.12)";
+    ctx.fill();
+    ctx.restore();
+
+    // Progress bar fill
+    const fillW = Math.max(4, Math.round((m.messageCount / maxCount) * BAR_W));
+    ctx.save();
+    roundedRect(ctx, BAR_START, rCY - 5, fillW, 10, 5);
+    const barFill = ctx.createLinearGradient(BAR_START, 0, BAR_START + fillW, 0);
+    if (i === 0) {
+      barFill.addColorStop(0, "#FFD700"); barFill.addColorStop(1, "#ffaa00");
+    } else if (i === 1) {
+      barFill.addColorStop(0, "#C0C0C0"); barFill.addColorStop(1, "#a0a0a0");
+    } else if (i === 2) {
+      barFill.addColorStop(0, "#CD7F32"); barFill.addColorStop(1, "#a0601e");
+    } else {
+      barFill.addColorStop(0, "#7b00ff"); barFill.addColorStop(1, "#00b4ff");
+    }
+    ctx.fillStyle = barFill;
+    ctx.shadowBlur = i < 3 ? 6 : 3;
+    ctx.shadowColor = i === 0 ? "#FFD700" : i === 1 ? "#C0C0C0" : i === 2 ? "#CD7F32" : "#7b00ff";
+    ctx.fill();
+    ctx.restore();
+
+    // Message count
+    ctx.save();
+    ctx.font = `bold 11px "DejaVu"`;
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillStyle = i < 3 ? MEDAL[i] : "rgba(191,128,255,0.70)";
+    if (i < 3) { ctx.shadowBlur = 6; ctx.shadowColor = MEDAL[i]; }
+    ctx.fillText(m.messageCount.toLocaleString(), RX + RW, rCY);
+    ctx.restore();
+  }
+
+  // Footer separator + timestamp
+  const FY = H - FOOTER_H;
+  ctx.save();
+  const fG = ctx.createLinearGradient(RX, 0, RX + RW, 0);
+  fG.addColorStop(0, "rgba(120,0,255,0.40)");
+  fG.addColorStop(1, "rgba(0,180,255,0.15)");
+  ctx.strokeStyle = fG; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(RX, FY + 4); ctx.lineTo(RX + RW, FY + 4); ctx.stroke();
+  ctx.restore();
+
+  const updStr = opts.updatedAt.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
+  ctx.save();
+  ctx.font = `8px "DejaVu"`;
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(191,128,255,0.30)";
+  ctx.textAlign = "left";  ctx.fillText("Priya Bot", RX + 2, FY + 16);
+  ctx.textAlign = "right"; ctx.fillText(`Updated: ${updStr} IST`, RX + RW, FY + 16);
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Shared text wrap helper ──────────────────────────────────────────────────
+
+function splitLines(ctx: SKRSContext2D, text: string, maxWidth: number): string[] {
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const test = line + word + " ";
+    if (ctx.measureText(test).width > maxWidth && line !== "") {
+      lines.push(line.trim());
+      line = word + " ";
+    } else {
+      line = test;
+    }
+  }
+  if (line.trim()) lines.push(line.trim());
+  return lines;
+}
+
+function wrapText(
+  ctx: SKRSContext2D,
+  text: string,
+  x: number,
+  startY: number,
+  maxWidth: number,
+  lineHeight: number
+): number {
+  const words = text.split(" ");
+  let line = "";
+  let y = startY;
+  for (const word of words) {
+    const test = line + word + " ";
+    if (ctx.measureText(test).width > maxWidth && line !== "") {
+      ctx.fillText(line.trim(), x, y);
+      line = word + " ";
+      y += lineHeight;
+    } else {
+      line = test;
+    }
+  }
+  if (line.trim()) {
+    ctx.fillText(line.trim(), x, y);
+    y += lineHeight;
+  }
+  return y;
+}
+
+// ─── Roast card ───────────────────────────────────────────────────────────────
+
+export async function generateRoastCard(target: CardUser, roastText: string): Promise<Buffer> {
+  const W = 820, H = 340;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#0e0100");
+  bg.addColorStop(0.4, "#1a0500");
+  bg.addColorStop(0.7, "#200800");
+  bg.addColorStop(1, "#0a0000");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  const fireGlow = ctx.createRadialGradient(W / 2, H + 60, 10, W / 2, H + 60, 380);
+  fireGlow.addColorStop(0, "rgba(255,120,0,0.22)");
+  fireGlow.addColorStop(0.5, "rgba(220,50,0,0.10)");
+  fireGlow.addColorStop(1, "transparent");
+  ctx.fillStyle = fireGlow;
+  ctx.fillRect(0, 0, W, H);
+
+  const leftGlow = ctx.createRadialGradient(150, H / 2, 10, 150, H / 2, 200);
+  leftGlow.addColorStop(0, "rgba(255,60,0,0.18)");
+  leftGlow.addColorStop(1, "transparent");
+  ctx.fillStyle = leftGlow;
+  ctx.fillRect(0, 0, W, H);
+
+  for (let i = 0; i < 80; i++) {
+    const ex = (i * 193.7 + 7) % W;
+    const ey = (i * 83.1 + 13) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.07 + (i % 6) * 0.04;
+    ctx.fillStyle = i % 3 === 0 ? "#ff6600" : i % 3 === 1 ? "#ff2200" : "#ffaa00";
+    ctx.beginPath();
+    ctx.arc(ex, ey, i % 7 === 0 ? 1.5 : 0.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.save();
+  roundedRect(ctx, 8, 8, W - 16, H - 16, 20);
+  const borderG = ctx.createLinearGradient(0, 0, W, H);
+  borderG.addColorStop(0, "#ff4500");
+  borderG.addColorStop(0.5, "#ff8c00aa");
+  borderG.addColorStop(1, "#ff4500");
+  ctx.strokeStyle = borderG;
+  ctx.lineWidth = 2.5;
+  ctx.shadowBlur = 22;
+  ctx.shadowColor = "#ff4500";
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  roundedRect(ctx, 14, 14, W - 28, H - 28, 15);
+  ctx.strokeStyle = "rgba(255,100,0,0.08)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  const DIV_X = 280;
+  ctx.save();
+  const divG = ctx.createLinearGradient(DIV_X, 30, DIV_X, H - 30);
+  divG.addColorStop(0, "transparent");
+  divG.addColorStop(0.3, "rgba(255,80,0,0.40)");
+  divG.addColorStop(0.7, "rgba(255,140,0,0.30)");
+  divG.addColorStop(1, "transparent");
+  ctx.strokeStyle = divG;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(DIV_X, 30);
+  ctx.lineTo(DIV_X, H - 30);
+  ctx.stroke();
+  ctx.restore();
+
+  const AV_CX = 145, AV_CY = H / 2 - 8, AV_R = 90;
+
+  ctx.save();
+  roundedRect(ctx, AV_CX - 52, AV_CY - AV_R - 34, 104, 24, 12);
+  ctx.fillStyle = "rgba(255,60,0,0.20)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,80,0,0.55)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+  ctx.save();
+  ctx.font = `bold 11px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ff8c00";
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = "#ff4500";
+  ctx.fillText("\uD83D\uDD25 ROASTED \uD83D\uDD25", AV_CX, AV_CY - AV_R - 22);
+  ctx.restore();
+
+  await drawAvatar(ctx, target.avatarUrl, AV_CX, AV_CY, AV_R, "#ff4500", "#ff6600", target.username[0]);
+
+  ctx.save();
+  ctx.font = `bold 14px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = "#ff4500";
+  ctx.fillText(truncate(target.username, 16), AV_CX, AV_CY + AV_R + 10);
+  ctx.restore();
+
+  const TX = DIV_X + 28;
+  const TEXT_MAX_W = W - TX - 32;
+
+  ctx.save();
+  ctx.font = `bold 11px "DejaVu"`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "rgba(255,140,0,0.55)";
+  ctx.fillText("THE VERDICT:", TX, 40);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `bold 48px "DejaVu"`;
+  ctx.fillStyle = "rgba(255,80,0,0.14)";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText("\u201C", TX - 4, 42);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `15px "DejaVu"`;
+  ctx.fillStyle = "#ffe0cc";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  wrapText(ctx, roastText, TX + 12, 72, TEXT_MAX_W, 26);
+  ctx.restore();
+
+  ctx.save();
+  const barG = ctx.createLinearGradient(TX, 0, W - 22, 0);
+  barG.addColorStop(0, "#ff4500");
+  barG.addColorStop(0.5, "#ff8c00");
+  barG.addColorStop(1, "#ff4500");
+  roundedRect(ctx, TX, H - 36, W - TX - 22, 4, 2);
+  ctx.fillStyle = barG;
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = "#ff4500";
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `11px "DejaVu"`;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillStyle = "rgba(255,255,255,0.20)";
+  ctx.fillText("Priya Bot", W - 28, H - 20);
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Action card (hug / slap / poke / etc.) ──────────────────────────────────
+
+export async function generateActionCard(
+  from: CardUser,
+  to: CardUser,
+  action: string,
+  emoji: string,
+  color1: string,
+  color2: string
+): Promise<Buffer> {
+  const W = 800, H = 300;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#08080f");
+  bg.addColorStop(0.5, "#110818");
+  bg.addColorStop(1, "#06060e");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  const wash = ctx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, 300);
+  wash.addColorStop(0, color1 + "22");
+  wash.addColorStop(1, "transparent");
+  ctx.fillStyle = wash;
+  ctx.fillRect(0, 0, W, H);
+
+  for (let i = 0; i < 60; i++) {
+    const sx = (i * 177.3 + 11) % W;
+    const sy = (i * 91.7 + 7) % H;
+    ctx.save();
+    ctx.globalAlpha = 0.08 + (i % 5) * 0.04;
+    ctx.fillStyle = i % 2 === 0 ? color1 : color2;
+    ctx.beginPath();
+    ctx.arc(sx, sy, i % 9 === 0 ? 1.4 : 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.save();
+  roundedRect(ctx, 8, 8, W - 16, H - 16, 18);
+  const borderG = ctx.createLinearGradient(0, 0, W, H);
+  borderG.addColorStop(0, color1);
+  borderG.addColorStop(0.5, color2 + "aa");
+  borderG.addColorStop(1, color1);
+  ctx.strokeStyle = borderG;
+  ctx.lineWidth = 2.5;
+  ctx.shadowBlur = 18;
+  ctx.shadowColor = color1;
+  ctx.stroke();
+  ctx.restore();
+
+  const AV_R = 78;
+  const AV_Y = H / 2;
+
+  await drawAvatar(ctx, from.avatarUrl, 140, AV_Y, AV_R, color1, color1, from.username[0]);
+  await drawAvatar(ctx, to.avatarUrl, W - 140, AV_Y, AV_R, color2, color2, to.username[0]);
+
+  ctx.save();
+  ctx.font = `bold 44px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(emoji, W / 2, AV_Y - 20);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `bold 17px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const aGrad = ctx.createLinearGradient(W / 2 - 80, 0, W / 2 + 80, 0);
+  aGrad.addColorStop(0, color1);
+  aGrad.addColorStop(0.5, "#ffffff");
+  aGrad.addColorStop(1, color2);
+  ctx.fillStyle = aGrad;
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = color1;
+  ctx.fillText(action, W / 2, AV_Y + 20);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `bold 14px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowBlur = 6;
+  ctx.shadowColor = color1;
+  ctx.fillText(truncate(from.username, 12), 140, AV_Y + AV_R + 10);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `bold 14px "DejaVu"`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowBlur = 6;
+  ctx.shadowColor = color2;
+  ctx.fillText(truncate(to.username, 12), W - 140, AV_Y + AV_R + 10);
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}
+
+// ─── Snipe card ───────────────────────────────────────────────────────────────
+
+export interface SnipeData {
+  authorName: string;
+  authorAvatar: string | null;
+  content: string;
+  deletedAt: number;
+}
+
+export async function generateSnipeCard(data: SnipeData): Promise<Buffer> {
+  const W = 620;
+  const PADDING = 16;
+  const AV_R = 20;
+  const AV_CX = PADDING + AV_R;
+  const MSG_X = AV_CX + AV_R + 12;
+  const MSG_W = W - MSG_X - PADDING;
+  const LINE_H = 20;
+  const CONTENT_FONT_SIZE = 15;
+
+  const tempCanvas = createCanvas(W, 100);
+  const tempCtx = tempCanvas.getContext("2d");
+  tempCtx.font = `${CONTENT_FONT_SIZE}px "DejaVu"`;
+  const rawLines = data.content.split("\n");
+  const contentLines: string[] = [];
+  for (const raw of rawLines) {
+    const wrapped = splitLines(tempCtx, raw || " ", MSG_W);
+    contentLines.push(...wrapped);
+  }
+
+  const TOP_PAD = 16;
+  const NAME_Y = TOP_PAD + AV_R;
+  const CONTENT_Y = NAME_Y + 6;
+  const contentBlockH = contentLines.length * LINE_H;
+  const H = Math.max(CONTENT_Y + contentBlockH + TOP_PAD, 80);
+
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = "#313338";
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = "#f04747";
+  ctx.fillRect(0, 0, 3, H);
+
+  const AV_CY = NAME_Y;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(AV_CX, AV_CY, AV_R, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+
+  const avatarBuf = await fetchAvatar(data.authorAvatar, 128);
+  let avatarDrawn = false;
+  if (avatarBuf) {
+    try {
+      const img = await loadImage(avatarBuf);
+      ctx.drawImage(img, AV_CX - AV_R, AV_CY - AV_R, AV_R * 2, AV_R * 2);
+      avatarDrawn = true;
+    } catch { /* fallback */ }
+  }
+  if (!avatarDrawn) {
+    ctx.fillStyle = "#5865f2";
+    ctx.fillRect(AV_CX - AV_R, AV_CY - AV_R, AV_R * 2, AV_R * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `bold 18px "DejaVu"`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText((data.authorName[0] ?? "?").toUpperCase(), AV_CX, AV_CY);
+  }
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `bold 15px "DejaVu"`;
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(truncate(data.authorName, 32), MSG_X, NAME_Y + 5);
+  const nameWidth = ctx.measureText(truncate(data.authorName, 32)).width;
+  ctx.restore();
+
+  const elapsed = Math.round((Date.now() - data.deletedAt) / 1000);
+  const timeLabel =
+    elapsed < 60 ? `${elapsed}s ago` :
+    elapsed < 3600 ? `${Math.round(elapsed / 60)}m ago` :
+    `${Math.round(elapsed / 3600)}h ago`;
+
+  ctx.save();
+  ctx.font = `11px "DejaVu"`;
+  ctx.fillStyle = "#a3a6aa";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(`deleted • ${timeLabel}`, MSG_X + nameWidth + 10, NAME_Y + 5);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `${CONTENT_FONT_SIZE}px "DejaVu"`;
+  ctx.fillStyle = "#dcddde";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  for (let i = 0; i < contentLines.length; i++) {
+    ctx.fillText(contentLines[i], MSG_X, CONTENT_Y + (i + 1) * LINE_H);
+  }
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `10px "DejaVu"`;
+  ctx.fillStyle = "#4f545c";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillText("Priya Snipe", W - PADDING, H - 4);
+  ctx.restore();
+
+  return canvas.toBuffer("image/png");
+}

@@ -1,0 +1,1 @@
+- [Dashboard auth token](dashboard-auth.md) — token is in localStorage key `dashboard_token`; use that for manual fetch() calls in dashboard pages
