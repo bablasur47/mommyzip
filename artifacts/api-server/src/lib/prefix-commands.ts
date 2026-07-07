@@ -52,11 +52,14 @@ export function invalidatePrefixCache(guildId: string) {
 // key = "marry:guildId:fromId:toId" or "adopt:guildId:fromId:toId"
 const pendingRequests = new Set<string>();
 
+// Family relationships are global across all servers
+const GLOBAL_FAMILY = "global";
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function getOrCreateRelationship(userId: string, guildId: string) {
+async function getOrCreateRelationship(userId: string) {
   return UserRelationship.findOneAndUpdate(
-    { userId, guildId },
+    { userId, guildId: GLOBAL_FAMILY },
     { $setOnInsert: { parents: [], children: [] } },
     { upsert: true, new: true }
   );
@@ -174,8 +177,8 @@ async function handleMarry(message: Message, client: Client, args: string[]) {
   }
 
   const [myRel, theirRel] = await Promise.all([
-    getOrCreateRelationship(message.author.id, guildId),
-    getOrCreateRelationship(targetId, guildId),
+    getOrCreateRelationship(message.author.id),
+    getOrCreateRelationship(targetId),
   ]);
 
   if (myRel.marriedTo) {
@@ -241,11 +244,11 @@ async function handleMarry(message: Message, client: Client, args: string[]) {
       const now = new Date();
       await Promise.all([
         UserRelationship.findOneAndUpdate(
-          { userId: message.author.id, guildId },
+          { userId: message.author.id, guildId: GLOBAL_FAMILY },
           { $set: { marriedTo: targetId, marriedAt: now } }
         ),
         UserRelationship.findOneAndUpdate(
-          { userId: targetId, guildId },
+          { userId: targetId, guildId: GLOBAL_FAMILY },
           { $set: { marriedTo: message.author.id, marriedAt: now } }
         ),
       ]);
@@ -291,7 +294,7 @@ async function handleDivorce(message: Message, client: Client) {
     return;
   }
   const guildId = message.guild.id;
-  const myRel = await UserRelationship.findOne({ userId: message.author.id, guildId });
+  const myRel = await UserRelationship.findOne({ userId: message.author.id, guildId: GLOBAL_FAMILY });
 
   if (!myRel?.marriedTo) {
     await message.reply("Tu married hi nahi hai toh divorce kaise lega 😅");
@@ -303,11 +306,11 @@ async function handleDivorce(message: Message, client: Client) {
 
   await Promise.all([
     UserRelationship.findOneAndUpdate(
-      { userId: message.author.id, guildId },
+      { userId: message.author.id, guildId: GLOBAL_FAMILY },
       { $set: { marriedTo: null, marriedAt: null } }
     ),
     UserRelationship.findOneAndUpdate(
-      { userId: spouseId, guildId },
+      { userId: spouseId, guildId: GLOBAL_FAMILY },
       { $set: { marriedTo: null, marriedAt: null } }
     ),
   ]);
@@ -343,8 +346,8 @@ async function handleAdopt(message: Message, client: Client, args: string[]) {
   }
 
   const [myRel, theirRel] = await Promise.all([
-    getOrCreateRelationship(message.author.id, guildId),
-    getOrCreateRelationship(targetId, guildId),
+    getOrCreateRelationship(message.author.id),
+    getOrCreateRelationship(targetId),
   ]);
 
   if (theirRel.parents.length >= 2) {
@@ -406,11 +409,11 @@ async function handleAdopt(message: Message, client: Client, args: string[]) {
 
       await Promise.all([
         UserRelationship.findOneAndUpdate(
-          { userId: message.author.id, guildId },
+          { userId: message.author.id, guildId: GLOBAL_FAMILY },
           { $addToSet: { children: targetId } }
         ),
         UserRelationship.findOneAndUpdate(
-          { userId: targetId, guildId },
+          { userId: targetId, guildId: GLOBAL_FAMILY },
           { $addToSet: { parents: message.author.id } }
         ),
       ]);
@@ -463,7 +466,7 @@ async function handleUnadopt(message: Message, client: Client, args: string[]) {
     return;
   }
 
-  const myRel = await UserRelationship.findOne({ userId: message.author.id, guildId });
+  const myRel = await UserRelationship.findOne({ userId: message.author.id, guildId: GLOBAL_FAMILY });
   if (!myRel?.children.includes(targetId)) {
     await message.reply("Ye tera/teri child hai hi nahi!");
     return;
@@ -471,11 +474,11 @@ async function handleUnadopt(message: Message, client: Client, args: string[]) {
 
   await Promise.all([
     UserRelationship.findOneAndUpdate(
-      { userId: message.author.id, guildId },
+      { userId: message.author.id, guildId: GLOBAL_FAMILY },
       { $pull: { children: targetId } }
     ),
     UserRelationship.findOneAndUpdate(
-      { userId: targetId, guildId },
+      { userId: targetId, guildId: GLOBAL_FAMILY },
       { $pull: { parents: message.author.id } }
     ),
   ]);
@@ -498,9 +501,9 @@ async function handleFamily(message: Message, client: Client, args: string[]) {
   } catch { return; }
 
   try {
-    const rel = await UserRelationship.findOne({ userId: targetId, guildId });
+    const rel = await UserRelationship.findOne({ userId: targetId, guildId: GLOBAL_FAMILY });
     const spouseRel = rel?.marriedTo
-      ? await UserRelationship.findOne({ userId: rel.marriedTo, guildId })
+      ? await UserRelationship.findOne({ userId: rel.marriedTo, guildId: GLOBAL_FAMILY })
       : null;
 
     // Direct parents (max 4)
@@ -509,7 +512,7 @@ async function handleFamily(message: Message, client: Client, args: string[]) {
     // Grandparents: parents of each parent (max 6 total)
     const gpSets = await Promise.all(
       parentIds.map((pid) =>
-        UserRelationship.findOne({ userId: pid, guildId }).then((r) => r?.parents ?? [])
+        UserRelationship.findOne({ userId: pid, guildId: GLOBAL_FAMILY }).then((r) => r?.parents ?? [])
       )
     );
     const grandparentIds = [...new Set<string>(gpSets.flat())].slice(0, 6);
@@ -524,13 +527,13 @@ async function handleFamily(message: Message, client: Client, args: string[]) {
     const MAX_DEPTH = 4;  // levels down from user (child, grandchild, great-grandchild, gx2)
     const MAX_PER_NODE = 6;
 
-    async function fetchChildNode(childId: string, depth: number, guildId: string): Promise<FamilyChildNode | null> {
+    async function fetchChildNode(childId: string, depth: number): Promise<FamilyChildNode | null> {
       if (depth > MAX_DEPTH) return null;
-      const cr = await UserRelationship.findOne({ userId: childId, guildId });
+      const cr = await UserRelationship.findOne({ userId: childId, guildId: GLOBAL_FAMILY });
       if (!cr) return null;
 
       const csr = cr.marriedTo
-        ? await UserRelationship.findOne({ userId: cr.marriedTo, guildId })
+        ? await UserRelationship.findOne({ userId: cr.marriedTo, guildId: GLOBAL_FAMILY })
         : null;
 
       const mergedChildIds = [
@@ -547,7 +550,7 @@ async function handleFamily(message: Message, client: Client, args: string[]) {
 
       const childNodes: FamilyChildNode[] = [];
       for (const gcId of mergedChildIds) {
-        const node = await fetchChildNode(gcId, depth + 1, guildId);
+        const node = await fetchChildNode(gcId, depth + 1);
         if (node) childNodes.push(node);
       }
 
@@ -559,7 +562,7 @@ async function handleFamily(message: Message, client: Client, args: string[]) {
     }
 
     // Fetch child tree for each top-level child
-    const childFetches = childIds.map((cid) => fetchChildNode(cid, 1, guildId));
+    const childFetches = childIds.map((cid) => fetchChildNode(cid, 1));
     const childResults = await Promise.all(childFetches);
     const childNodes = childResults.filter((n): n is FamilyChildNode => n !== null);
 
@@ -623,7 +626,7 @@ async function handleMarriageCard(message: Message, client: Client, args: string
   const guildId = message.guild.id;
   const targetId = getMentionedUser(message, args) ?? message.author.id;
 
-  const rel = await UserRelationship.findOne({ userId: targetId, guildId });
+  const rel = await UserRelationship.findOne({ userId: targetId, guildId: GLOBAL_FAMILY });
 
   if (!rel?.marriedTo) {
     const isSelf = targetId === message.author.id;
@@ -664,7 +667,7 @@ async function handleParents(message: Message, client: Client, args: string[]): 
   const guildId = message.guild.id;
   const targetId = getMentionedUser(message, args) ?? message.author.id;
 
-  const rel = await UserRelationship.findOne({ userId: targetId, guildId });
+  const rel = await UserRelationship.findOne({ userId: targetId, guildId: GLOBAL_FAMILY });
   const targetUser = await resolveCardUser(targetId, client, guildId);
 
   if (!rel || rel.parents.length === 0) {
@@ -707,7 +710,7 @@ async function handleProfile(message: Message, client: Client, args: string[]): 
   const [cardUser, dbUser, rel] = await Promise.all([
     resolveCardUser(targetId, client, guildId),
     BotUser.findOne({ userId: targetId }),
-    UserRelationship.findOne({ userId: targetId, guildId }),
+    UserRelationship.findOne({ userId: targetId, guildId: GLOBAL_FAMILY }),
   ]);
 
   // Resolve spouse name if married
@@ -747,7 +750,7 @@ async function handleRunaway(message: Message): Promise<void> {
   const guildId = message.guild.id;
   const userId = message.author.id;
 
-  const rel = await UserRelationship.findOne({ userId, guildId });
+  const rel = await UserRelationship.findOne({ userId, guildId: GLOBAL_FAMILY });
 
   if (!rel || !rel.parents || rel.parents.length === 0) {
     await message.reply("Tu kahin bhaag nahi sakta — tere koi parents hi nahi hain! 😂");
@@ -759,7 +762,7 @@ async function handleRunaway(message: Message): Promise<void> {
   // Remove self from each parent's children list
   for (const parentId of parentIds) {
     await UserRelationship.findOneAndUpdate(
-      { userId: parentId, guildId },
+      { userId: parentId, guildId: GLOBAL_FAMILY },
       { $pull: { children: userId } }
     );
   }
@@ -1312,12 +1315,12 @@ async function handleForceAdopt(message: Message, client: Client, args: string[]
 
   await Promise.all([
     UserRelationship.findOneAndUpdate(
-      { userId: parentId, guildId },
+      { userId: parentId, guildId: GLOBAL_FAMILY },
       { $addToSet: { children: childId } },
       { upsert: true }
     ),
     UserRelationship.findOneAndUpdate(
-      { userId: childId, guildId },
+      { userId: childId, guildId: GLOBAL_FAMILY },
       { $addToSet: { parents: parentId } },
       { upsert: true }
     ),
